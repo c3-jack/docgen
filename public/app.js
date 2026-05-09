@@ -1035,6 +1035,24 @@ function setupEventListeners() {
     sendMessage(chatInput.value);
   });
 
+  // Open Claude.ai for design work
+  $('#btn-claude-design').addEventListener('click', async () => {
+    const docTitle = $('#doc-artifact-title')?.textContent || '';
+    const prompt = `You are a C3 AI design assistant. Create polished, professional visual assets using C3 AI brand styling:
+- Colors: black (#000000), white, and minimal accent blue
+- Font: clean sans-serif (Inter or similar)
+- Feel: enterprise, technical, premium
+- Always include "C3 AI" wordmark
+${docTitle && docTitle !== 'No document' ? `\nI'm currently working on: "${docTitle}". Help me create supporting visuals, diagrams, or presentation materials for this.` : ''}
+
+What would you like me to design?`;
+    try {
+      await navigator.clipboard.writeText(prompt);
+      toast('Prompt copied to clipboard — paste it into Claude to start designing', 'success');
+    } catch {}
+    window.open('https://claude.ai/new', '_blank');
+  });
+
   fileInput.addEventListener('change', async (e) => {
     const file = e.target.files[0];
     if (!file) return;

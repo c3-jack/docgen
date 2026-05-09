@@ -20,7 +20,12 @@ let db;
 
 async function initDb() {
   const SQL = await initSqlJs();
-  const dbPath = path.join(__dirname, 'claude-docs.db');
+  // Store DB in user's home directory so it persists across app updates
+  const dbDir = path.join(process.env.HOME || __dirname, '.docgen');
+  if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
+  const dbPath = path.join(dbDir, 'claude-docs.db');
+  dbSavePath = dbPath;
+  console.log('[db] path:', dbPath);
   if (fs.existsSync(dbPath)) {
     const buf = fs.readFileSync(dbPath);
     db = new SQL.Database(buf);
@@ -76,10 +81,12 @@ async function initDb() {
   saveDb();
 }
 
+let dbSavePath;
+
 function saveDb() {
   const data = db.export();
   const buf = Buffer.from(data);
-  fs.writeFileSync(path.join(__dirname, 'claude-docs.db'), buf);
+  fs.writeFileSync(dbSavePath, buf);
 }
 
 // --- Filesystem API ---
