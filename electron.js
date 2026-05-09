@@ -1,4 +1,4 @@
-const { app, BrowserWindow, globalShortcut } = require('electron');
+const { app, BrowserWindow, globalShortcut, shell } = require('electron');
 const path = require('path');
 const { fork } = require('child_process');
 
@@ -47,6 +47,12 @@ function createWindow() {
   });
 
   mainWindow.loadURL(`http://localhost:${PORT}`);
+
+  // Open external links in default browser, not in Electron
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    shell.openExternal(url);
+    return { action: 'deny' };
+  });
 
   mainWindow.on('closed', () => {
     mainWindow = null;

@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>DocGen</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#9998;</text></svg>">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -205,7 +206,7 @@
     .file-source-btn:hover:not(.active) { background: var(--surface2); }
 
     #file-panel.collapsed #file-source-toggle,
-    #file-panel.collapsed #file-search-wrap { display: none; }
+    #file-panel.collapsed #file-search-wrap { display: none !important; }
 
     #sidebar-section-label {
       padding: 16px 20px 8px;
@@ -343,6 +344,7 @@
       flex-shrink: 0;
       overflow: hidden;
       min-height: 36px;
+      -webkit-app-region: drag;
     }
 
     #open-tabs {
@@ -359,6 +361,7 @@
       align-items: center;
       gap: 6px;
       padding: 0 14px;
+      -webkit-app-region: no-drag;
       min-width: 0;
       max-width: 200px;
       height: 36px;

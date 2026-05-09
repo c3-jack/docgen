@@ -4,6 +4,7 @@ let activeSessionId = null;
 let currentDoc = null;
 // isStreaming is now per-session via streamingState
 let currentFilePath = null;
+let c3BrandMode = false;
 
 // --- DOM ---
 const $ = (sel) => document.querySelector(sel);
@@ -172,7 +173,7 @@ function renderSessionList() {
 }
 
 function relativeTime(timestamp) {
-  if (!timestamp) return '';
+  if (!timestamp) return 'Just now';
   const now = Date.now();
   const fixed = timestamp.endsWith('Z') ? timestamp : timestamp + 'Z';
   const then = new Date(fixed).getTime();
@@ -189,7 +190,30 @@ function relativeTime(timestamp) {
   return new Date(timestamp).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 }
 
+let _creatingSession = false;
 async function createSession(title) {
+  if (_creatingSession) return;
+  _creatingSession = true;
+
+  // Clean up any existing empty "New Document" sessions first
+  const empties = sessions.filter(s => s.title === 'New Document' && s.id !== activeSessionId);
+  for (const s of empties) {
+    // Check if it has any messages or documents
+    try {
+      const [msgRes, docRes] = await Promise.all([
+        fetch(`/api/sessions/${s.id}/messages`),
+        fetch(`/api/sessions/${s.id}/document`),
+      ]);
+      const msgs = await msgRes.json();
+      const doc = await docRes.json();
+      if (msgs.length === 0 && !doc) {
+        await fetch(`/api/sessions/${s.id}`, { method: 'DELETE' });
+        sessions = sessions.filter(x => x.id !== s.id);
+        openTabs = openTabs.filter(id => id !== s.id);
+      }
+    } catch {}
+  }
+
   const res = await fetch('/api/sessions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -199,11 +223,13 @@ async function createSession(title) {
   sessions.unshift(session);
   renderSessionList();
   switchSession(session.id);
+  _creatingSession = false;
 }
 
 async function renameSession(id, currentTitle) {
   const name = prompt('Session name:', currentTitle);
   if (!name || name === currentTitle) return;
+  manuallyRenamed.add(id);
   await fetch(`/api/sessions/${id}`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
@@ -212,6 +238,7 @@ async function renameSession(id, currentTitle) {
   const s = sessions.find(s => s.id === id);
   if (s) s.title = name;
   renderSessionList();
+  renderOpenTabs();
 }
 
 async function cloneSession(sourceId) {
@@ -234,6 +261,7 @@ async function cloneSession(sourceId) {
   });
   const newSession = await sessionRes.json();
   sessions.unshift(newSession);
+  manuallyRenamed.add(newSession.id); // Preserve "Copy of..." title
 
   // Copy document content to the new session if it exists
   if (sourceDoc && sourceDoc.content) {
@@ -258,6 +286,9 @@ async function cloneSession(sourceId) {
 
 // Track per-session streaming state
 const streamingState = {}; // sessionId -> { sendTime }
+
+// Track sessions that were manually renamed (don't auto-override their title)
+const manuallyRenamed = new Set();
 
 // Open tabs — sessions currently open as tabs
 let openTabs = []; // array of session IDs
@@ -292,7 +323,8 @@ async function loadMessages(sessionId) {
 }
 
 function renderMessages(messages) {
-  if (messages.length === 0 && !currentDoc) {
+  const hasStreaming = !!streamingState[activeSessionId];
+  if (messages.length === 0 && !currentDoc && !hasStreaming) {
     messagesInner.innerHTML = '';
     enterWelcomeMode();
     return;
@@ -300,7 +332,7 @@ function renderMessages(messages) {
 
   exitWelcomeMode();
 
-  if (messages.length === 0) {
+  if (messages.length === 0 && !hasStreaming) {
     messagesInner.innerHTML = `
       <div class="empty-state">
         <div class="empty-state-icon">&#9998;</div>
@@ -371,8 +403,8 @@ function detectFormatAndUpdateUI(filename) {
 
   if (!filename) {
     badge.textContent = '';
-    btnDocx.style.display = '';
-    btnPdf.style.display = '';
+    btnDocx.style.display = 'none';
+    btnPdf.style.display = 'none';
     return;
   }
 
@@ -412,8 +444,8 @@ function updateArtifactTitle(html, filename) {
   }
   docArtifactTitle.textContent = title || filename || 'Untitled';
 
-  // Keep session name in sync with artifact title
-  if (title && activeSessionId) {
+  // Keep session name in sync with artifact title (unless manually renamed)
+  if (title && activeSessionId && !manuallyRenamed.has(activeSessionId)) {
     const s = sessions.find(s => s.id === activeSessionId);
     if (s && s.title !== title) {
       s.title = title;
@@ -423,6 +455,7 @@ function updateArtifactTitle(html, filename) {
         body: JSON.stringify({ title }),
       });
       renderSessionList();
+      renderOpenTabs();
     }
   }
 }
@@ -520,6 +553,7 @@ function autoNameSession(html) {
         body: JSON.stringify({ title }),
       });
       renderSessionList();
+      renderOpenTabs();
     }
   }
 }
@@ -538,6 +572,7 @@ function autoNameFromMessage(text) {
       body: JSON.stringify({ title }),
     });
     renderSessionList();
+    renderOpenTabs();
   }
 }
 
@@ -671,9 +706,11 @@ async function sendMessage(text) {
       if (inlineThinking) inlineThinking.remove();
       if (!fullText && xhr.status !== 200) {
         bubble.textContent = `Error: Request failed (${xhr.status})`;
-      }
-      if (fullText) {
+      } else if (fullText) {
         bubble.textContent = stripDocumentTags(fullText);
+      } else {
+        // No text response (e.g. only a document_update) — clear the thinking indicator
+        bubble.textContent = 'Done — document updated.';
       }
       sendBtn.disabled = false;
       chatInput.focus();
@@ -920,7 +957,15 @@ function setupEventListeners() {
   // Welcome cards
   $('#welcome-new').addEventListener('click', () => {
     exitWelcomeMode();
-    // Just focus the input — user describes what to create
+    // Show empty state placeholder if no messages
+    if (!messagesInner.innerHTML.trim()) {
+      messagesInner.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-state-icon">&#9998;</div>
+          <div class="empty-state-text">Start a conversation.<br>Ask Claude to create or edit a document.</div>
+        </div>
+      `;
+    }
     chatInput.focus();
   });
   $('#welcome-open').addEventListener('click', () => fileInput.click());
@@ -943,7 +988,6 @@ function setupEventListeners() {
   $('#btn-copy-doc').addEventListener('click', copyDocToClipboard);
 
   // C3 Brandify — adds branding instruction to the prompt
-  let c3BrandMode = false;
   $('#btn-brandify').addEventListener('click', () => {
     c3BrandMode = !c3BrandMode;
     $('#btn-brandify').classList.toggle('active', c3BrandMode);
@@ -1036,21 +1080,8 @@ function setupEventListeners() {
   });
 
   // Open Claude.ai for design work
-  $('#btn-claude-design').addEventListener('click', async () => {
-    const docTitle = $('#doc-artifact-title')?.textContent || '';
-    const prompt = `You are a C3 AI design assistant. Create polished, professional visual assets using C3 AI brand styling:
-- Colors: black (#000000), white, and minimal accent blue
-- Font: clean sans-serif (Inter or similar)
-- Feel: enterprise, technical, premium
-- Always include "C3 AI" wordmark
-${docTitle && docTitle !== 'No document' ? `\nI'm currently working on: "${docTitle}". Help me create supporting visuals, diagrams, or presentation materials for this.` : ''}
-
-What would you like me to design?`;
-    try {
-      await navigator.clipboard.writeText(prompt);
-      toast('Prompt copied to clipboard — paste it into Claude to start designing', 'success');
-    } catch {}
-    window.open('https://claude.ai/new', '_blank');
+  $('#btn-claude-design').addEventListener('click', () => {
+    window.open('https://claude.ai/design', '_blank');
   });
 
   fileInput.addEventListener('change', async (e) => {
@@ -1574,54 +1605,65 @@ function toggleFindBar() {
 
 let findMatches = [];
 let findIndex = -1;
+let lastFindQuery = '';
 
 function findInDoc(query, direction) {
   const frame = document.getElementById('doc-frame');
   if (!frame || !frame.contentDocument) return;
 
-  clearFindHighlights();
-
   if (!query || query.length < 2) {
+    clearFindHighlights();
     $('#doc-find-count').textContent = '';
+    lastFindQuery = '';
     return;
   }
 
-  const body = frame.contentDocument.body;
-  const walker = frame.contentDocument.createTreeWalker(body, NodeFilter.SHOW_TEXT);
-  const matches = [];
+  // If query changed, rebuild highlights; otherwise just navigate
+  if (query !== lastFindQuery) {
+    clearFindHighlights();
+    lastFindQuery = query;
+    findIndex = -1;
 
-  while (walker.nextNode()) {
-    const node = walker.currentNode;
-    const lowerText = node.textContent.toLowerCase();
-    const lowerQuery = query.toLowerCase();
-    let idx = lowerText.indexOf(lowerQuery);
-    while (idx !== -1) {
-      matches.push({ node, index: idx, length: query.length });
-      idx = lowerText.indexOf(lowerQuery, idx + 1);
+    const body = frame.contentDocument.body;
+    const walker = frame.contentDocument.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    const matches = [];
+
+    while (walker.nextNode()) {
+      const node = walker.currentNode;
+      const lowerText = node.textContent.toLowerCase();
+      const lowerQuery = query.toLowerCase();
+      let idx = lowerText.indexOf(lowerQuery);
+      while (idx !== -1) {
+        matches.push({ node, index: idx, length: query.length });
+        idx = lowerText.indexOf(lowerQuery, idx + 1);
+      }
+    }
+
+    if (matches.length === 0) {
+      $('#doc-find-count').textContent = '0 results';
+      findIndex = -1;
+      return;
+    }
+
+    // Highlight all matches (reverse order to preserve offsets)
+    for (let i = matches.length - 1; i >= 0; i--) {
+      const m = matches[i];
+      try {
+        const range = frame.contentDocument.createRange();
+        range.setStart(m.node, m.index);
+        range.setEnd(m.node, m.index + m.length);
+        const span = frame.contentDocument.createElement('mark');
+        span.className = 'find-highlight';
+        span.style.cssText = 'background:#FBBF24;padding:1px 0;border-radius:2px;';
+        range.surroundContents(span);
+      } catch(e) {}
     }
   }
 
-  if (matches.length === 0) {
-    $('#doc-find-count').textContent = '0 results';
-    findIndex = -1;
-    return;
-  }
-
-  // Highlight all matches (reverse order to preserve offsets)
-  for (let i = matches.length - 1; i >= 0; i--) {
-    const m = matches[i];
-    try {
-      const range = frame.contentDocument.createRange();
-      range.setStart(m.node, m.index);
-      range.setEnd(m.node, m.index + m.length);
-      const span = frame.contentDocument.createElement('mark');
-      span.className = 'find-highlight';
-      span.style.cssText = 'background:#FBBF24;padding:1px 0;border-radius:2px;';
-      range.surroundContents(span);
-    } catch(e) {}
-  }
-
+  // Navigate among existing highlights
   const marks = frame.contentDocument.querySelectorAll('.find-highlight');
+  if (marks.length === 0) return;
+
   if (direction === 'prev') {
     findIndex = findIndex <= 0 ? marks.length - 1 : findIndex - 1;
   } else {
@@ -1647,6 +1689,7 @@ function clearFindHighlights() {
   });
   findMatches = [];
   findIndex = -1;
+  lastFindQuery = '';
 }
 
 // --- Email ---
