@@ -1,0 +1,6 @@
+node_modules/
+dist/
+claude-docs.db
+uploads/
+*.dmg
+.DS_Store

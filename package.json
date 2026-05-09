@@ -1,0 +1,40 @@
+{
+  "name": "claude-docs",
+  "version": "1.0.0",
+  "description": "Claude document editor with live preview",
+  "main": "electron.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "node server.js",
+    "build": "electron-builder --mac",
+    "pack": "electron-builder --mac --dir"
+  },
+  "build": {
+    "appId": "com.c3ai.claude-docs",
+    "productName": "DocGen",
+    "mac": {
+      "target": "dmg",
+      "icon": "icon.icns",
+      "category": "public.app-category.productivity"
+    },
+    "files": [
+      "**/*",
+      "!claude-docs.db"
+    ],
+    "extraResources": []
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "docx": "^9.1.0",
+    "express": "^4.21.0",
+    "html-to-docx": "^1.8.0",
+    "mammoth": "^1.8.0",
+    "multer": "^1.4.5-lts.1",
+    "open": "^10.1.0",
+    "sql.js": "^1.11.0"
+  },
+  "devDependencies": {
+    "electron": "33.4.11",
+    "electron-builder": "25.1.8"
+  }
+}
