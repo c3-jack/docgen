@@ -7,12 +7,26 @@ const mammoth = require('mammoth');
 const initSqlJs = require('sql.js');
 
 const app = express();
-const PORT = 3847;
+const PORT = process.env.PORT || 3847;
 
 app.use(express.json({ limit: '50mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
 
-const upload = multer({ dest: path.join(__dirname, 'uploads') });
+// When packaged in asar, __dirname is read-only. Use ~/.docgen for writable paths.
+const isAsar = __dirname.includes('app.asar');
+const publicDir = isAsar
+  ? path.join(__dirname, '..', 'app.asar.unpacked', 'public')
+  : path.join(__dirname, 'public');
+const uploadsDir = isAsar
+  ? path.join(process.env.HOME || '/tmp', '.docgen', 'uploads')
+  : path.join(__dirname, 'uploads');
+
+if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+
+app.use(express.static(publicDir));
+// Fallback: serve from asar public if unpacked doesn't exist
+if (isAsar) app.use(express.static(path.join(__dirname, 'public')));
+
+const upload = multer({ dest: uploadsDir });
 
 let db;
 

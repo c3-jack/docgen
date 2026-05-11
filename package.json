@@ -21,6 +21,10 @@
       "**/*",
       "!claude-docs.db"
     ],
+    "asarUnpack": [
+      "public/**",
+      "node_modules/sql.js/dist/**"
+    ],
     "extraResources": []
   },
   "dependencies": {
