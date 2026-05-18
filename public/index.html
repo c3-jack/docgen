@@ -1500,6 +1500,47 @@
     </div>
   </div>
 
+  <!-- Setup Overlay -->
+  <div id="setup-overlay" style="display:none;position:fixed;inset:0;z-index:300;background:var(--bg);flex-direction:column;align-items:center;justify-content:center;font-family:inherit;">
+    <div style="max-width:480px;text-align:center;">
+      <div style="font-size:48px;margin-bottom:16px;">&#9998;</div>
+      <h1 style="font-size:24px;font-weight:600;margin-bottom:8px;color:var(--text);">Welcome to DocGen</h1>
+      <p style="color:var(--subtext);margin-bottom:32px;line-height:1.5;">Let's make sure everything is set up.</p>
+      <div id="setup-checklist" style="text-align:left;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:20px 24px;margin-bottom:24px;">
+        <div id="setup-claude-row" style="display:flex;align-items:center;gap:12px;padding:8px 0;">
+          <span id="setup-claude-icon" style="font-size:18px;">&#9898;</span>
+          <div style="flex:1;">
+            <div style="font-weight:500;color:var(--text);">Claude Code CLI</div>
+            <div id="setup-claude-detail" style="font-size:12px;color:var(--subtext);margin-top:2px;">Checking...</div>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:12px;padding:8px 0;">
+          <span style="font-size:18px;">&#9989;</span>
+          <div style="flex:1;">
+            <div style="font-weight:500;color:var(--text);">Server</div>
+            <div style="font-size:12px;color:var(--subtext);margin-top:2px;">Running</div>
+          </div>
+        </div>
+      </div>
+      <div id="setup-install-hint" style="display:none;background:var(--accent-light);border:1px solid var(--accent);border-radius:10px;padding:16px;margin-bottom:20px;text-align:left;">
+        <div style="font-weight:600;color:var(--text);margin-bottom:6px;">Install Claude Code</div>
+        <div style="font-size:13px;color:var(--text-dim);line-height:1.5;">Run this in your terminal:<br><code style="background:var(--surface2);padding:2px 8px;border-radius:4px;font-size:12px;">npm install -g @anthropic-ai/claude-code</code></div>
+      </div>
+      <div style="display:flex;gap:10px;justify-content:center;">
+        <button id="setup-check-btn" class="modal-btn secondary" style="padding:10px 20px;">Check Again</button>
+        <button id="setup-continue-btn" class="modal-btn primary" style="padding:10px 20px;">Continue</button>
+      </div>
+      <div id="setup-skip-note" style="display:none;font-size:12px;color:var(--subtext);margin-top:12px;">Chat features require Claude Code. File browsing, editing, and saving still work.</div>
+      <button id="setup-debug-btn" style="margin-top:16px;background:none;border:1px solid var(--border);border-radius:6px;padding:6px 14px;font-size:12px;color:var(--subtext);cursor:pointer;font-family:inherit;">Copy Debug Info</button>
+    </div>
+  </div>
+
+  <!-- Connection Lost Banner -->
+  <div id="connection-banner" style="display:none;position:fixed;top:0;left:0;right:0;z-index:250;background:var(--red);color:#fff;text-align:center;padding:8px 16px;font-size:13px;font-weight:500;">
+    Connection lost — trying to reconnect...
+    <button onclick="copyDebugInfo()" style="margin-left:12px;background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.4);border-radius:4px;color:#fff;padding:2px 10px;font-size:12px;cursor:pointer;font-family:inherit;">Copy Debug Info</button>
+  </div>
+
   <!-- Toast -->
   <div id="toast"></div>
 

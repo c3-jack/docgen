@@ -2,44 +2,60 @@ const express = require('express');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const { spawn } = require('child_process');
+const os = require('os');
+const crypto = require('crypto');
+const { spawn, execFileSync } = require('child_process');
 const mammoth = require('mammoth');
 const initSqlJs = require('sql.js');
+const { resolveClaudeBinary, getClaudeVersion, clearCache: clearClaudeCache } = require('./claude-resolver');
+const log = require('./logger');
 
 const app = express();
 const PORT = process.env.PORT || 3847;
+const START_TIME = Date.now();
 
 app.use(express.json({ limit: '50mb' }));
 
-// When packaged in asar, __dirname is read-only. Use ~/.docgen for writable paths.
+// When packaged in asar, __dirname is read-only. Use writable paths.
 const isAsar = __dirname.includes('app.asar');
 const publicDir = isAsar
   ? path.join(__dirname, '..', 'app.asar.unpacked', 'public')
   : path.join(__dirname, 'public');
-const uploadsDir = isAsar
-  ? path.join(process.env.HOME || '/tmp', '.docgen', 'uploads')
-  : path.join(__dirname, 'uploads');
-
-if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+const uploadDir = path.join(os.tmpdir(), 'docgen-uploads');
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
 
 app.use(express.static(publicDir));
-// Fallback: serve from asar public if unpacked doesn't exist
 if (isAsar) app.use(express.static(path.join(__dirname, 'public')));
 
-const upload = multer({ dest: uploadsDir });
+const upload = multer({ dest: uploadDir });
 
 let db;
+let dbError = null;
+
+const ALLOWED_ROOTS = [os.homedir(), '/Volumes'];
+
+function validatePath(requestedPath) {
+  if (!requestedPath) return null;
+  const resolved = path.resolve(requestedPath);
+  if (ALLOWED_ROOTS.some(root => resolved.startsWith(root))) return resolved;
+  return null;
+}
+
+function requireDb(req, res, next) {
+  if (dbError) return res.status(503).json({ error: 'Database unavailable', detail: dbError });
+  next();
+}
 
 // --- DB Setup ---
 
 async function initDb() {
+  try {
   const SQL = await initSqlJs();
-  // Store DB in user's home directory so it persists across app updates
-  const dbDir = path.join(process.env.HOME || __dirname, '.docgen');
+  const dbDir = path.join(os.homedir(), '.docgen');
   if (!fs.existsSync(dbDir)) fs.mkdirSync(dbDir, { recursive: true });
   const dbPath = path.join(dbDir, 'claude-docs.db');
   dbSavePath = dbPath;
-  console.log('[db] path:', dbPath);
+  log.info('db', 'opening database', { path: dbPath });
   if (fs.existsSync(dbPath)) {
     const buf = fs.readFileSync(dbPath);
     db = new SQL.Database(buf);
@@ -93,6 +109,10 @@ async function initDb() {
     )
   `);
   saveDb();
+  } catch (err) {
+    dbError = err.message;
+    log.error('db', 'initialization failed', err);
+  }
 }
 
 let dbSavePath;
@@ -106,7 +126,8 @@ function saveDb() {
 // --- Filesystem API ---
 
 app.get('/api/fs/list', (req, res) => {
-  const dirPath = req.query.path || process.env.HOME || '/';
+  const dirPath = validatePath(req.query.path || os.homedir());
+  if (!dirPath) return res.status(403).json({ error: 'Access denied: path outside allowed directories' });
   try {
     const entries = fs.readdirSync(dirPath, { withFileTypes: true });
     const items = entries
@@ -128,8 +149,8 @@ app.get('/api/fs/list', (req, res) => {
 });
 
 app.get('/api/fs/read', async (req, res) => {
-  const filePath = req.query.path;
-  if (!filePath) return res.status(400).json({ error: 'path required' });
+  const filePath = validatePath(req.query.path);
+  if (!filePath) return res.status(403).json({ error: 'Access denied: path outside allowed directories' });
 
   try {
     const ext = path.extname(filePath).toLowerCase();
@@ -154,8 +175,9 @@ app.get('/api/fs/read', async (req, res) => {
 });
 
 app.post('/api/fs/save', async (req, res) => {
-  const { path: savePath, content, format } = req.body;
-  if (!savePath) return res.status(400).json({ error: 'path required' });
+  const { content, format } = req.body;
+  const savePath = validatePath(req.body.path);
+  if (!savePath) return res.status(403).json({ error: 'Access denied: path outside allowed directories' });
 
   try {
     const ext = path.extname(savePath).toLowerCase();
@@ -381,22 +403,33 @@ User: ${message}`;
 
   let fullResponse = '';
 
-  // Find claude binary
-  const claudeBin = process.env.CLAUDE_PATH || '/opt/homebrew/bin/claude';
+  const resolved = resolveClaudeBinary();
+  if (!resolved.path) {
+    res.write(`data: ${JSON.stringify({ type: 'error', content: resolved.error })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
+    res.end();
+    return;
+  }
 
   try {
-    console.log('[chat] spawning claude at:', claudeBin);
-    const claude = spawn(claudeBin, [
+    log.info('chat', 'spawning claude', { path: resolved.path });
+    const claude = spawn(resolved.path, [
       '--print',
       '--verbose',
       '--output-format', 'stream-json',
     ], {
-      env: { ...process.env, PATH: process.env.PATH + ':/opt/homebrew/bin:/usr/local/bin' },
+      env: { ...process.env },
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: false,
     });
 
-    console.log('[chat] claude pid:', claude.pid);
+    log.info('chat', 'claude process started', { pid: claude.pid });
+
+    // 5-minute timeout
+    const spawnTimeout = setTimeout(() => {
+      log.warn('chat', 'claude timed out after 5 minutes', { pid: claude.pid });
+      claude.kill('SIGTERM');
+    }, 300000);
 
     claude.stdin.write(prompt);
     claude.stdin.end();
@@ -414,7 +447,6 @@ User: ${message}`;
         try {
           const event = JSON.parse(line);
 
-          // Stream text from assistant message events
           if (event.type === 'assistant' && event.message?.content) {
             for (const block of event.message.content) {
               if (block.type === 'text' && block.text) {
@@ -425,7 +457,6 @@ User: ${message}`;
                   res.write(`data: ${JSON.stringify({ type: 'text', content: newText })}\n\n`);
                 }
               }
-              // Surface tool use to frontend
               if (block.type === 'tool_use') {
                 const toolName = (block.name || '').replace(/^mcp__\w+__/, '').replace(/_/g, ' ');
                 res.write(`data: ${JSON.stringify({ type: 'tool_use', tool: toolName })}\n\n`);
@@ -433,7 +464,6 @@ User: ${message}`;
             }
           }
 
-          // Final result
           if (event.type === 'result' && event.result) {
             if (!fullResponse) {
               fullResponse = event.result;
@@ -449,12 +479,13 @@ User: ${message}`;
     let stderrBuf = '';
     claude.stderr.on('data', (chunk) => {
       stderrBuf += chunk.toString();
-      console.log('[chat] stderr:', chunk.toString().slice(0, 200));
+      log.warn('chat', 'claude stderr', { output: chunk.toString().slice(0, 500) });
     });
 
     claude.on('close', (code, signal) => {
-      console.log('[chat] claude closed, code:', code, 'signal:', signal, 'stderr:', stderrBuf.slice(0, 500));
-      // Process remaining buffer
+      clearTimeout(spawnTimeout);
+      log.info('chat', 'claude process exited', { code, signal });
+
       if (buffer.trim()) {
         try {
           const event = JSON.parse(buffer);
@@ -466,14 +497,13 @@ User: ${message}`;
       }
 
       if (code !== 0 && !fullResponse) {
-        res.write(`data: ${JSON.stringify({ type: 'error', content: stderrBuf || `Claude exited with code ${code}` })}\n\n`);
+        const errMsg = signal === 'SIGTERM' ? 'Claude timed out after 5 minutes' : (stderrBuf || `Claude exited with code ${code}`);
+        res.write(`data: ${JSON.stringify({ type: 'error', content: errMsg })}\n\n`);
       }
 
-      // Save assistant message
       if (fullResponse) {
         db.run('INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)', [sessionId, 'assistant', fullResponse]);
 
-        // Extract document update
         const docMatch = fullResponse.match(/<updated_document>([\s\S]*?)<\/updated_document>/);
         if (docMatch) {
           const newContent = docMatch[1].trim();
@@ -501,23 +531,15 @@ User: ${message}`;
     });
 
     claude.on('error', (err) => {
-      res.write(`data: ${JSON.stringify({ type: 'error', content: `Failed to start claude: ${err.message}. Is Claude Code installed?` })}\n\n`);
+      clearTimeout(spawnTimeout);
+      res.write(`data: ${JSON.stringify({ type: 'error', content: `Failed to start Claude: ${err.message}. Install it with: npm install -g @anthropic-ai/claude-code` })}\n\n`);
+      res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
       res.end();
-    });
-
-    // Handle client disconnect — only kill if still running
-    let claudeDone = false;
-    claude.on('close', () => {
-      claudeDone = true;
-      console.log('[chat] claude process done');
-    });
-    req.on('close', () => {
-      console.log('[chat] req close event fired, claudeDone:', claudeDone);
-      // Don't kill claude — let it finish
     });
 
   } catch (err) {
     res.write(`data: ${JSON.stringify({ type: 'error', content: err.message })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`);
     res.end();
   }
 });
@@ -528,28 +550,31 @@ app.post('/api/sharepoint/search', async (req, res) => {
   const { query } = req.body;
   if (!query) return res.status(400).json({ error: 'query required' });
 
-  const claudeBin = process.env.CLAUDE_PATH || '/opt/homebrew/bin/claude';
-  const prompt = `Search SharePoint for files matching "${query}". Use the search-sharepoint-files MCP tool. Return ONLY a JSON array of results, no other text. Each result should have: { "name": "filename", "path": "full path", "site": "site name", "modified": "date", "url": "web url if available" }. If no results, return [].`;
+  const resolved = resolveClaudeBinary();
+  if (!resolved.path) return res.status(503).json({ error: resolved.error });
+
+  const safeQuery = String(query).replace(/"/g, '\\"');
+  const prompt = `Search SharePoint for files matching "${safeQuery}". Use the search-sharepoint-files MCP tool. Return ONLY a JSON array of results, no other text. Each result should have: { "name": "filename", "path": "full path", "site": "site name", "modified": "date", "url": "web url if available" }. If no results, return [].`;
 
   try {
-    const claude = spawn(claudeBin, ['--print', '--output-format', 'json'], {
-      env: { ...process.env, PATH: process.env.PATH + ':/opt/homebrew/bin:/usr/local/bin' },
+    const claude = spawn(resolved.path, ['--print', '--output-format', 'json'], {
+      env: { ...process.env },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+
+    const spTimeout = setTimeout(() => claude.kill('SIGTERM'), 120000);
 
     claude.stdin.write(prompt);
     claude.stdin.end();
 
     let stdout = '';
-    let stderr = '';
     claude.stdout.on('data', d => stdout += d.toString());
-    claude.stderr.on('data', d => stderr += d.toString());
 
     claude.on('close', (code) => {
+      clearTimeout(spTimeout);
       try {
         const parsed = JSON.parse(stdout);
         const resultText = parsed.result || stdout;
-        // Try to extract JSON array from the response
         const arrMatch = resultText.match(/\[[\s\S]*\]/);
         if (arrMatch) {
           res.json({ results: JSON.parse(arrMatch[0]) });
@@ -562,6 +587,7 @@ app.post('/api/sharepoint/search', async (req, res) => {
     });
 
     claude.on('error', (err) => {
+      clearTimeout(spTimeout);
       res.status(500).json({ error: err.message });
     });
   } catch (err) {
@@ -573,14 +599,20 @@ app.post('/api/sharepoint/download', async (req, res) => {
   const { path: filePath, site } = req.body;
   if (!filePath) return res.status(400).json({ error: 'path required' });
 
-  const claudeBin = process.env.CLAUDE_PATH || '/opt/homebrew/bin/claude';
-  const prompt = `Download the SharePoint file at path "${filePath}"${site ? ` from site "${site}"` : ''}. Use the download-sharepoint-file MCP tool. Save it to /tmp/sp-download and return the local file path. Return ONLY the local file path, nothing else.`;
+  const resolved = resolveClaudeBinary();
+  if (!resolved.path) return res.status(503).json({ error: resolved.error });
+
+  const safePath = String(filePath).replace(/"/g, '\\"');
+  const safeSite = site ? String(site).replace(/"/g, '\\"') : '';
+  const prompt = `Download the SharePoint file at path "${safePath}"${safeSite ? ` from site "${safeSite}"` : ''}. Use the download-sharepoint-file MCP tool. Save it to /tmp/sp-download and return the local file path. Return ONLY the local file path, nothing else.`;
 
   try {
-    const claude = spawn(claudeBin, ['--print', '--output-format', 'json'], {
-      env: { ...process.env, PATH: process.env.PATH + ':/opt/homebrew/bin:/usr/local/bin' },
+    const claude = spawn(resolved.path, ['--print', '--output-format', 'json'], {
+      env: { ...process.env },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
+
+    const spTimeout = setTimeout(() => claude.kill('SIGTERM'), 120000);
 
     claude.stdin.write(prompt);
     claude.stdin.end();
@@ -589,6 +621,7 @@ app.post('/api/sharepoint/download', async (req, res) => {
     claude.stdout.on('data', d => stdout += d.toString());
 
     claude.on('close', async (code) => {
+      clearTimeout(spTimeout);
       try {
         const parsed = JSON.parse(stdout);
         const localPath = (parsed.result || '').trim();
@@ -611,6 +644,11 @@ app.post('/api/sharepoint/download', async (req, res) => {
       } catch {
         res.json({ error: 'Failed to process download', message: stdout.substring(0, 500) });
       }
+    });
+
+    claude.on('error', (err) => {
+      clearTimeout(spTimeout);
+      res.status(500).json({ error: err.message });
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -659,15 +697,16 @@ function saveDocVersion(sessionId, content, label) {
 
 app.get('/api/fs/search', (req, res) => {
   const query = req.query.q;
-  const dir = req.query.path || process.env.HOME || '/';
+  const dir = validatePath(req.query.path || os.homedir());
+  if (!dir) return res.status(403).json({ error: 'Access denied' });
   if (!query || query.length < 2) return res.json({ results: [] });
 
-  // Use find command for recursive search
-  const { execSync } = require('child_process');
+  const sanitizedQuery = query.replace(/[^a-zA-Z0-9._\- ]/g, '');
   try {
-    const cmd = `find ${JSON.stringify(dir)} -maxdepth 5 -iname "*${query.replace(/[^a-zA-Z0-9._\- ]/g, '')}*" -not -path '*/.*' 2>/dev/null | head -50`;
-    const output = execSync(cmd, { timeout: 5000, encoding: 'utf-8' });
-    const results = output.trim().split('\n').filter(Boolean).map(p => ({
+    const output = execFileSync('find', [
+      dir, '-maxdepth', '5', '-iname', `*${sanitizedQuery}*`, '-not', '-path', '*/.*',
+    ], { timeout: 5000, encoding: 'utf-8', maxBuffer: 1024 * 1024 });
+    const results = output.trim().split('\n').filter(Boolean).slice(0, 50).map(p => ({
       name: path.basename(p),
       path: p,
       isDir: fs.statSync(p).isDirectory(),
@@ -693,6 +732,54 @@ app.post('/api/settings', (req, res) => {
   res.json({ ok: true });
 });
 
+// --- Status / Health ---
+
+app.get('/api/status', (req, res) => {
+  if (req.query.refresh) clearClaudeCache();
+  const resolved = resolveClaudeBinary();
+  const version = resolved.path ? getClaudeVersion(resolved.path) : null;
+  res.json({
+    claude: { found: !!resolved.path, path: resolved.path, version, error: resolved.error },
+    db: { ok: !dbError, error: dbError },
+    server: { uptime: Math.floor((Date.now() - START_TIME) / 1000) },
+  });
+});
+
+app.get('/api/debug', (req, res) => {
+  const resolved = resolveClaudeBinary();
+  const version = resolved.path ? getClaudeVersion(resolved.path) : null;
+  const logPath = path.join(log.logDir, `docgen-${new Date().toISOString().slice(0, 10)}.log`);
+  let recentLogs = '';
+  try {
+    const content = fs.readFileSync(logPath, 'utf-8');
+    const lines = content.trim().split('\n');
+    recentLogs = lines.slice(-50).join('\n');
+  } catch {}
+  res.json({
+    system: {
+      platform: process.platform,
+      arch: process.arch,
+      nodeVersion: process.version,
+      electronVersion: process.versions.electron || null,
+    },
+    claude: { found: !!resolved.path, path: resolved.path, version, error: resolved.error },
+    db: { ok: !dbError, error: dbError },
+    server: { uptime: Math.floor((Date.now() - START_TIME) / 1000), port: PORT },
+    logs: recentLogs,
+  });
+});
+
+app.get('/api/documents/by-path', requireDb, (req, res) => {
+  const savePath = req.query.path;
+  if (!savePath) return res.status(400).json({ error: 'path required' });
+  const rows = db.exec('SELECT session_id FROM documents WHERE save_path = ? LIMIT 1', [savePath]);
+  if (rows.length > 0 && rows[0].values.length > 0) {
+    res.json({ sessionId: rows[0].values[0][0] });
+  } else {
+    res.json({ sessionId: null });
+  }
+});
+
 // --- Helpers ---
 
 function escapeHtml(text) {
@@ -705,12 +792,28 @@ function escapeHtml(text) {
 
 // --- Start ---
 
+process.on('uncaughtException', (err) => {
+  log.error('server', 'uncaught exception', err);
+});
+
+process.on('unhandledRejection', (reason) => {
+  log.error('server', 'unhandled rejection', reason instanceof Error ? reason : { reason: String(reason) });
+});
+
 async function start() {
+  const resolved = resolveClaudeBinary();
+  log.info('server', 'starting', {
+    port: PORT,
+    platform: process.platform,
+    arch: process.arch,
+    nodeVersion: process.version,
+    claude: resolved.path || resolved.error,
+    logDir: log.logDir,
+  });
+
   await initDb();
-  app.listen(PORT, () => {
-    console.log(`Claude Docs running at http://localhost:${PORT}`);
-    // Auto-open disabled for dev; use launch.command for production
-    // import('open').then(mod => mod.default(`http://localhost:${PORT}`));
+  app.listen(PORT, '127.0.0.1', () => {
+    log.info('server', `listening on http://127.0.0.1:${PORT}`);
   });
 }
 

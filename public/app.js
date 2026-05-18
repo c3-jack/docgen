@@ -1,3 +1,35 @@
+// --- Debug Info ---
+
+async function copyDebugInfo() {
+  try {
+    const res = await fetch('/api/debug');
+    const debug = await res.json();
+    const text = [
+      '=== DocGen Debug Info ===',
+      `Platform: ${debug.system.platform} ${debug.system.arch}`,
+      `Node: ${debug.system.nodeVersion}`,
+      `Electron: ${debug.system.electronVersion || 'N/A (browser mode)'}`,
+      `Claude: ${debug.claude.found ? debug.claude.version + ' at ' + debug.claude.path : 'NOT FOUND — ' + debug.claude.error}`,
+      `DB: ${debug.db.ok ? 'OK' : 'ERROR — ' + debug.db.error}`,
+      `Server uptime: ${debug.server.uptime}s`,
+      '',
+      '=== Recent Logs ===',
+      debug.logs || '(no logs)',
+    ].join('\n');
+    await navigator.clipboard.writeText(text);
+    toast('Debug info copied to clipboard', 'success');
+  } catch (err) {
+    toast('Failed to copy debug info: ' + err.message, 'error');
+  }
+}
+
+document.addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'd') {
+    e.preventDefault();
+    copyDebugInfo();
+  }
+});
+
 // --- State ---
 let sessions = [];
 let activeSessionId = null;
@@ -5,6 +37,7 @@ let currentDoc = null;
 // isStreaming is now per-session via streamingState
 let currentFilePath = null;
 let c3BrandMode = false;
+let claudeAvailable = true;
 
 // --- DOM ---
 const $ = (sel) => document.querySelector(sel);
@@ -27,9 +60,130 @@ const saveModal = $('#save-modal');
 const savePathInput = $('#save-path-input');
 const toastEl = $('#toast');
 
+// --- API Fetch Wrapper ---
+
+async function apiFetch(url, options) {
+  try {
+    const res = await fetch(url, options);
+    if (!res.ok) {
+      let errMsg = `Request failed (${res.status})`;
+      try {
+        const body = await res.json();
+        if (body.error) errMsg = body.error;
+      } catch {}
+      throw new Error(errMsg);
+    }
+    return res;
+  } catch (err) {
+    if (err.message === 'Failed to fetch' || err.message === 'NetworkError when attempting to fetch resource.') {
+      throw new Error('Cannot reach server — is DocGen still running?');
+    }
+    throw err;
+  }
+}
+
+// --- Connection Heartbeat ---
+
+let heartbeatFailures = 0;
+const HEARTBEAT_INTERVAL = 10000;
+const HEARTBEAT_THRESHOLD = 3;
+
+function startHeartbeat() {
+  setInterval(async () => {
+    try {
+      const res = await fetch('/api/status');
+      if (res.ok) {
+        if (heartbeatFailures >= HEARTBEAT_THRESHOLD) {
+          $('#connection-banner').style.display = 'none';
+          toast('Connection restored', 'success');
+        }
+        heartbeatFailures = 0;
+      } else {
+        heartbeatFailures++;
+      }
+    } catch {
+      heartbeatFailures++;
+    }
+    if (heartbeatFailures >= HEARTBEAT_THRESHOLD) {
+      $('#connection-banner').style.display = 'block';
+    }
+  }, HEARTBEAT_INTERVAL);
+}
+
+// --- Setup Flow ---
+
+async function checkSetup() {
+  try {
+    const res = await fetch('/api/status');
+    const status = await res.json();
+    const overlay = $('#setup-overlay');
+    const claudeIcon = $('#setup-claude-icon');
+    const claudeDetail = $('#setup-claude-detail');
+    const installHint = $('#setup-install-hint');
+    const skipNote = $('#setup-skip-note');
+
+    if (status.claude && status.claude.found) {
+      claudeIcon.innerHTML = '&#9989;';
+      claudeDetail.textContent = status.claude.version || status.claude.path;
+      installHint.style.display = 'none';
+      skipNote.style.display = 'none';
+      claudeAvailable = true;
+      return true;
+    } else {
+      claudeIcon.innerHTML = '&#10060;';
+      claudeDetail.textContent = status.claude ? status.claude.error : 'Not found';
+      installHint.style.display = 'block';
+      skipNote.style.display = 'block';
+      claudeAvailable = false;
+      return false;
+    }
+  } catch {
+    return false;
+  }
+}
+
+async function showSetupIfNeeded() {
+  const found = await checkSetup();
+  if (found) return;
+
+  const overlay = $('#setup-overlay');
+  overlay.style.display = 'flex';
+
+  return new Promise((resolve) => {
+    $('#setup-check-btn').addEventListener('click', async () => {
+      $('#setup-claude-icon').innerHTML = '&#9898;';
+      $('#setup-claude-detail').textContent = 'Checking...';
+      // If running in Electron, ask main process to re-detect
+      if (window.docgen && window.docgen.refreshClaudeStatus) {
+        await window.docgen.refreshClaudeStatus();
+      }
+      const ok = await checkSetup();
+      if (ok) {
+        overlay.style.display = 'none';
+        resolve();
+      }
+    });
+
+    $('#setup-debug-btn').addEventListener('click', () => copyDebugInfo());
+
+    $('#setup-continue-btn').addEventListener('click', () => {
+      overlay.style.display = 'none';
+      if (!claudeAvailable) {
+        chatInput.placeholder = 'Claude Code not installed — chat is disabled';
+        chatInput.disabled = true;
+        sendBtn.disabled = true;
+      }
+      resolve();
+    });
+  });
+}
+
 // --- Init ---
 
 async function init() {
+  await showSetupIfNeeded();
+  startHeartbeat();
+
   await loadSessions();
   if (sessions.length === 0) {
     await createSession('New Document');
@@ -781,26 +935,19 @@ async function openFileInDoc(filePath) {
     return;
   }
 
-  // Check if there's already a session for this file
-  // We need to check documents in each session — look for matching save_path
-  let existingSession = null;
-  for (const s of sessions) {
-    try {
-      const docRes = await fetch(`/api/sessions/${s.id}/document`);
-      const doc = await docRes.json();
-      if (doc && doc.save_path === filePath) {
-        existingSession = s;
-        break;
+  // Check if there's already a session for this file (single query)
+  try {
+    const byPathRes = await apiFetch(`/api/documents/by-path?path=${encodeURIComponent(filePath)}`);
+    const byPathData = await byPathRes.json();
+    if (byPathData && byPathData.session_id) {
+      const existingSession = sessions.find(s => s.id === byPathData.session_id);
+      if (existingSession) {
+        switchSession(existingSession.id);
+        toast(`Switched to ${existingSession.title}`, 'success');
+        return;
       }
-    } catch {}
-  }
-
-  if (existingSession) {
-    // Switch to existing session for this file
-    switchSession(existingSession.id);
-    toast(`Switched to ${existingSession.title}`, 'success');
-    return;
-  }
+    }
+  } catch {}
 
   try {
     const res = await fetch(`/api/fs/read?path=${encodeURIComponent(filePath)}`);
@@ -1407,9 +1554,10 @@ function toast(message, type = '') {
   toastEl.textContent = message;
   toastEl.className = `visible ${type}`;
   clearTimeout(toast._timer);
+  const duration = type === 'error' ? 8000 : 3000;
   toast._timer = setTimeout(() => {
     toastEl.className = '';
-  }, 3000);
+  }, duration);
 }
 
 // --- Doc page scaling ---
