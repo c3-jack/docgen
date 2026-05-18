@@ -1,13 +1,10 @@
 const { app, BrowserWindow, dialog, ipcMain, shell } = require('electron');
 const path = require('path');
 const http = require('http');
-const { fork } = require('child_process');
 const { resolveClaudeBinary, getClaudeVersion, clearCache } = require('./claude-resolver');
 const log = require('./logger');
 
 let mainWindow;
-let serverProcess;
-let intentionalQuit = false;
 
 const PORT = process.env.PORT || 3847;
 
@@ -34,39 +31,9 @@ const SPLASH_HTML = `<!DOCTYPE html>
 </body></html>`;
 
 function startServer() {
-  serverProcess = fork(path.join(__dirname, 'server-headless.js'), [], {
-    env: { ...process.env, PORT: String(PORT), NO_OPEN: '1' },
-    stdio: 'pipe',
-  });
-
-  serverProcess.stdout.on('data', (data) => {
-    log.info('electron', 'server stdout: ' + data.toString().trim());
-  });
-
-  serverProcess.stderr.on('data', (data) => {
-    log.warn('electron', 'server stderr: ' + data.toString().trim());
-  });
-
-  serverProcess.on('exit', (code, signal) => {
-    log.warn('electron', 'server process exited', { code, signal, intentionalQuit });
-    if (!intentionalQuit && mainWindow) {
-      log.info('electron', 'attempting server restart');
-      try {
-        startServer();
-        waitForServer(10000)
-          .then(() => {
-            if (mainWindow) mainWindow.loadURL(`http://127.0.0.1:${PORT}`);
-          })
-          .catch(() => {
-            dialog.showErrorBox('DocGen', 'The server crashed and could not be restarted. The app will now close.');
-            app.quit();
-          });
-      } catch {
-        dialog.showErrorBox('DocGen', 'The server crashed and could not be restarted. The app will now close.');
-        app.quit();
-      }
-    }
-  });
+  process.env.PORT = String(PORT);
+  process.env.NO_OPEN = '1';
+  require('./server.js');
 }
 
 function waitForServer(maxWaitMs = 15000) {
@@ -169,8 +136,6 @@ app.on('ready', async () => {
 
 app.on('window-all-closed', () => {
   log.info('electron', 'all windows closed, quitting');
-  intentionalQuit = true;
-  if (serverProcess) serverProcess.kill();
   app.quit();
 });
 
@@ -180,6 +145,4 @@ app.on('activate', () => {
 
 app.on('will-quit', () => {
   log.info('electron', 'will-quit');
-  intentionalQuit = true;
-  if (serverProcess) serverProcess.kill();
 });
